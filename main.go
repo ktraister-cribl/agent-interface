@@ -6,17 +6,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/widget"
 	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 	"image/color"
 
 	"github.com/ardanlabs/bucky/pkg/whisper"
@@ -30,7 +32,7 @@ type keyBinding struct {
 }
 
 type whiteDisabledTheme struct {
-    fyne.Theme
+	fyne.Theme
 }
 
 var (
@@ -91,7 +93,6 @@ func main() {
 	history.Wrapping = fyne.TextWrapWord
 	historyScroll := container.NewScroll(history)
 
-
 	// Status label
 	status := widget.NewLabel("Ready")
 
@@ -114,46 +115,48 @@ func main() {
 
 	// Inside main(), after talkBtn and status are defined:
 	triggerTalk := func() {
-	    // Reject if already processing or speaking
-	    if atomic.LoadInt32(&busy) == 1 {
-		status.SetText("Busy...")
-		return
-	    }
-	    atomic.StoreInt32(&busy, 1)
-
-	    talkBtn.Disable()
-	    status.SetText("Recording... speak now")
-
-	    go func() {
-		wavData := recordAudio()
-		if wavData == nil {
-		    atomic.StoreInt32(&busy, 0)
-		    fyne.DoAndWait(func() {
-			status.SetText("Ready")
-			talkBtn.Enable()
-		    })
-		    return
+		// Reject if already processing or speaking
+		if atomic.LoadInt32(&busy) == 1 {
+			status.SetText("Busy...")
+			return
 		}
-		fyne.DoAndWait(func() { status.SetText("Transcribing...") })
-		text := transcribe(wavData)
-		if text == "" {
-		    // BLANK_AUDIO — silently ignore
-		    atomic.StoreInt32(&busy, 0)
-		    fyne.DoAndWait(func() {
-			status.SetText("Ready")
-			talkBtn.Enable()
-		    })
-		    return
-		}
-		fyne.DoAndWait(func() { talkBtn.Enable() })
+		atomic.StoreInt32(&busy, 1)
 
-		// handleQuery + speak runs here, then clears busy
+		talkBtn.Disable()
+		status.SetText("Recording... speak now")
+		beep(800)
+
 		go func() {
-		    handleQuery(text, history, status, voiceCheck)
-		    atomic.StoreInt32(&busy, 0)
-		    fyne.DoAndWait(func() { status.SetText("Ready") })
+			wavData := recordAudio()
+			beep(400)
+			if wavData == nil {
+				atomic.StoreInt32(&busy, 0)
+				fyne.DoAndWait(func() {
+					status.SetText("Ready")
+					talkBtn.Enable()
+				})
+				return
+			}
+			fyne.DoAndWait(func() { status.SetText("Transcribing...") })
+			text := transcribe(wavData)
+			if text == "" {
+				// BLANK_AUDIO — silently ignore
+				atomic.StoreInt32(&busy, 0)
+				fyne.DoAndWait(func() {
+					status.SetText("Ready")
+					talkBtn.Enable()
+				})
+				return
+			}
+			fyne.DoAndWait(func() { talkBtn.Enable() })
+
+			// handleQuery + speak runs here, then clears busy
+			go func() {
+				handleQuery(text, history, status, voiceCheck)
+				atomic.StoreInt32(&busy, 0)
+				fyne.DoAndWait(func() { status.SetText("Ready") })
+			}()
 		}()
-	    }()
 	}
 
 	talkBtn = widget.NewButton("Talk", triggerTalk)
@@ -173,6 +176,7 @@ func main() {
 		options := []string{
 			"Ctrl+Space",
 			"Ctrl+T",
+			"Delete",
 			"F9",
 			"F10",
 			"Ctrl+Alt+Space",
@@ -181,6 +185,7 @@ func main() {
 		keyMap := map[string]keyBinding{
 			"Ctrl+Space":     {fyne.KeySpace, fyne.KeyModifierControl},
 			"Ctrl+T":         {fyne.KeyT, fyne.KeyModifierControl},
+			"Delete":         {fyne.KeyDelete, 0},
 			"F9":             {fyne.KeyF9, 0},
 			"F10":            {fyne.KeyF10, 0},
 			"Ctrl+Alt+Space": {fyne.KeySpace, fyne.KeyModifierControl | fyne.KeyModifierAlt},
@@ -228,6 +233,17 @@ func main() {
 		triggerTalk()
 	})
 	status.SetText("Ready (hotkey: Ctrl+Space)")
+
+	// In main(), before w.ShowAndRun():
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGUSR1)
+	go func() {
+		for range sigCh {
+			fyne.DoAndWait(func() {
+				triggerTalk()
+			})
+		}
+	}()
 
 	w.ShowAndRun()
 }
@@ -285,6 +301,11 @@ func transcribe(rawData []byte) string {
 
 // --- Handle a query ---
 func handleQuery(query string, history *widget.Entry, status *widget.Label, voiceCheck *widget.Check) {
+
+	if query == "[ Silence ]" {
+		return
+	}
+
 	fyne.DoAndWait(func() {
 		appendMessage(history, "You: "+query)
 		status.SetText("Thinking...")
@@ -350,9 +371,9 @@ func speak(text string) {
 
 // --- Helpers ---
 func appendMessage(history *widget.Entry, text string) {
-    current := history.Text
-    history.SetText(current + text + "\n")
-    history.CursorRow = len(strings.Split(history.Text, "\n")) - 1 // scroll to bottom
+	current := history.Text
+	history.SetText(current + text + "\n")
+	history.CursorRow = len(strings.Split(history.Text, "\n")) - 1 // scroll to bottom
 }
 
 func cleanForSpeech(text string) string {
@@ -381,8 +402,13 @@ func cleanForSpeech(text string) string {
 }
 
 func (t whiteDisabledTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
-    if name == theme.ColorNameDisabled {
-        return color.White
-    }
-    return t.Theme.Color(name, variant)
+	if name == theme.ColorNameDisabled {
+		return color.White
+	}
+	return t.Theme.Color(name, variant)
+}
+
+func beep(freq int) {
+	exec.Command("play", "-n", "-q", "-r", "22050", "-c", "1",
+		"synth", "0.1", "sine", fmt.Sprintf("%d", freq)).Run()
 }
