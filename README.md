@@ -1,6 +1,11 @@
 # Brave Agent Interface
 
-Voice-first AI assistant. Talk to it, it talks back. Built with Go, Fyne, whisper.cpp, and Piper TTS. Uses the Brave Search API for privacy-focused responses.
+Voice-first AI assistant for Ubuntu 26.04. Talk to it, it talks back. Built with Go, Fyne, whisper.cpp, and Piper TTS. Uses the Brave Search API for privacy-focused responses.
+
+
+<img width="608" height="547" alt="Screenshot From 2026-09-14 19-55-39" src="https://github.com/user-attachments/assets/936340a1-1f31-4836-a59b-e6ad2294b6fa" />
+
+
 
 ## Requirements
 
