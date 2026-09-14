@@ -7,12 +7,18 @@ Voice-first AI assistant for Ubuntu 26.04. Talk to it, it talks back. Built with
 
 
 
+
+
+
+
 ## Requirements
 
 - Ubuntu 26.04 LTS (x86_64)
 - Go 1.26+
 - A Brave Search API key (Answers plan)
 - A microphone and speakers
+
+
 
 ## Setup
 
@@ -108,6 +114,9 @@ go get github.com/ardanlabs/bucky
 go install .
 
 ```
+
+
+
 
 ## Run
 ```
