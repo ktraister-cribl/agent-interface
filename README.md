@@ -85,12 +85,13 @@ sudo keyd reload
 This binds Ctrl+Space globally to trigger the app's recording, even when the window isn't focused.
 
 ### 6. Environment variables
-Add to ~/.bashrc:
+Add to ~/.agent-interface.toml:
 
 ```
-export BUCKY_LIB=$HOME/.local/share/agent-interface/lib
-export BUCKY_TEST_MODEL=$HOME/.local/share/agent-interface/models/ggml-base.en.bin
-export BRAVE_API_KEY=your-key-here
+brave_api_key = "***redacted***"
+bucky_lib = "/home/ubuntu/.local/share/agent-interface/lib"
+whisper_model = "/home/ubuntu/.local/share/agent-interface/models/ggml-base.en.bin"
+piper_model = "/home/ubuntu/.local/share/piper/voices/en_US-lessac-medium.onnx "
 ```
 
 ### 7. Go dependencies and build
