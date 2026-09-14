@@ -21,10 +21,18 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"image/color"
 
+	"github.com/BurntSushi/toml"
 	"github.com/ardanlabs/bucky/pkg/whisper"
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 )
+
+type Config struct {
+	BraveAPIKey  string `toml:"brave_api_key"`
+	BuckyLib     string `toml:"bucky_lib"`
+	WhisperModel string `toml:"whisper_model"`
+	PiperModel   string `toml:"piper_model"`
+}
 
 type keyBinding struct {
 	key fyne.KeyName
@@ -51,10 +59,13 @@ var (
 )
 
 func main() {
-	buckyLib = os.Getenv("BUCKY_LIB")
-	whisperModel = os.Getenv("BUCKY_TEST_MODEL")
-	piperModel = os.Getenv("PIPER_TEST_MODEL")
-	braveKey = os.Getenv("BRAVE_API_KEY")
+	cfg := loadConfig()
+	fmt.Fprintf(os.Stderr, "DEBUG: model=%q lib=%q piper=%q\n", cfg.WhisperModel, cfg.BuckyLib, cfg.PiperModel)
+
+	braveKey = cfg.BraveAPIKey
+	buckyLib = cfg.BuckyLib
+	whisperModel = cfg.WhisperModel
+	piperModel = cfg.PiperModel
 
 	// Init whisper
 	if err := whisper.Load(buckyLib); err != nil {
@@ -411,4 +422,15 @@ func (t whiteDisabledTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVa
 func beep(freq int) {
 	exec.Command("play", "-n", "-q", "-r", "22050", "-c", "1",
 		"synth", "0.1", "sine", fmt.Sprintf("%d", freq)).Run()
+}
+
+func loadConfig() Config {
+	var cfg Config
+	path := os.ExpandEnv("$HOME/.agent-interface.toml")
+	_, err := toml.DecodeFile(path, &cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config: %v (expected at %s)\n", err, path)
+		os.Exit(1)
+	}
+	return cfg
 }
