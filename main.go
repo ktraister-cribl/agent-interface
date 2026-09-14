@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -56,6 +58,7 @@ var (
 	aplayMu         sync.Mutex
 	aplayRunning    int32 // use atomic
 	currentShortcut *desktop.CustomShortcut
+	conversation    strings.Builder
 )
 
 func main() {
@@ -120,6 +123,14 @@ func main() {
 		textInput.SetText("")
 		go handleQuery(q, history, status, voiceCheck)
 	})
+	sendBtn.Importance = widget.HighImportance
+
+	// Clear Button
+	clearBtn := widget.NewButton("Clear", func() {
+		history.SetText("")
+		conversation.Reset()
+	})
+	clearBtn.Importance = widget.WarningImportance
 
 	// Talk button
 	var talkBtn *widget.Button
@@ -171,6 +182,7 @@ func main() {
 	}
 
 	talkBtn = widget.NewButton("Talk", triggerTalk)
+	talkBtn.Importance = widget.SuccessImportance
 
 	// Stop button:
 	stopBtn := widget.NewButton("Stop", func() {
@@ -181,6 +193,7 @@ func main() {
 		aplayMu.Unlock()
 		status.SetText("Ready")
 	})
+	stopBtn.Importance = widget.DangerImportance
 
 	// Configure button
 	configureBtn := widget.NewButton("Configure", func() {
@@ -225,7 +238,7 @@ func main() {
 	})
 
 	// Layout
-	buttonRow := container.NewHBox(talkBtn, stopBtn, configureBtn, voiceCheck)
+	buttonRow := container.NewHBox(talkBtn, stopBtn, clearBtn, configureBtn, voiceCheck)
 	inputRow := container.NewBorder(nil, nil, nil, sendBtn, textInput)
 
 	w.SetContent(container.NewBorder(
@@ -261,20 +274,85 @@ func main() {
 
 // --- Audio recording (sox + arecord, silence detection) ---
 func recordAudio() []byte {
+	const (
+		sampleRate     = 16000
+		frameMs        = 30
+		frameSamples   = sampleRate * frameMs / 1000 // 480
+		speechThresh   = 0.015                       // RMS threshold (tune: raise if noisy, lower if quiet)
+		silenceMs      = 1000                        // stop after 1s of silence
+		maxDurationMs  = 20000                       // hard cap: 20s
+		startTimeoutMs = 3000                        // give up if no speech within 3s of starting
+	)
+
 	tmpFile, err := os.CreateTemp("", "rec_*.raw")
 	if err != nil {
 		return nil
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
-	tmpFile.Close()
 
-	// Fixed 5-second recording, raw PCM (no WAV header to corrupt)
-	cmd := exec.Command("arecord", "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", "5", tmpPath)
+	cmd := exec.Command("arecord", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw", "-")
 	cmd.Stdin = nil
-	if err := cmd.Run(); err != nil {
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		tmpFile.Close()
 		return nil
 	}
+	if err := cmd.Start(); err != nil {
+		tmpFile.Close()
+		return nil
+	}
+
+	frameBytes := frameSamples * 2 // S16 = 2 bytes per sample
+	frame := make([]byte, frameBytes)
+
+	var (
+		silenceFrames  int
+		totalFrames    int
+		speechDetected bool
+		maxFrames      = maxDurationMs / frameMs
+		startTimeout   = startTimeoutMs / frameMs
+	)
+
+	for totalFrames < maxFrames {
+		_, err := io.ReadFull(pipe, frame)
+		if err != nil {
+			break
+		}
+		totalFrames++
+
+		// Compute RMS
+		rms := 0.0
+		for i := 0; i < frameSamples; i++ {
+			s := int16(frame[i*2]) | int16(frame[i*2+1])<<8
+			f := float64(s) / 32768.0
+			rms += f * f
+		}
+		rms = math.Sqrt(rms / float64(frameSamples))
+
+		isSpeech := rms > speechThresh
+
+		if isSpeech {
+			speechDetected = true
+			silenceFrames = 0
+			tmpFile.Write(frame) // only write frames that contain speech (and surrounding context)
+		} else if speechDetected {
+			tmpFile.Write(frame) // write trailing silence too (natural ending)
+			silenceFrames++
+			if silenceFrames*frameMs >= silenceMs {
+				break // done — 1s of silence after speech
+			}
+		} else {
+			// Haven't detected speech yet
+			if totalFrames >= startTimeout {
+				break // timeout — no speech detected, return nothing
+			}
+		}
+	}
+
+	cmd.Process.Kill()
+	cmd.Wait()
+	tmpFile.Close()
 
 	data, err := os.ReadFile(tmpPath)
 	if err != nil || len(data) < 100 {
@@ -322,10 +400,20 @@ func handleQuery(query string, history *widget.Entry, status *widget.Label, voic
 		status.SetText("Thinking...")
 	})
 
+	// Append to history
+	conversation.WriteString("User: " + query + "\n")
+
+	// Build the message with context
+	contextPrefix := ""
+	if conversation.Len() > 0 {
+		contextPrefix = "Previous conversation:\n" + conversation.String() + "\n\nCurrent question: "
+	}
+
+	// Use contextPrefix + query as the message
 	stream := client.Chat.Completions.NewStreaming(context.Background(), openai.ChatCompletionNewParams{
 		Model: openai.ChatModel("brave"),
 		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.UserMessage(query),
+			openai.UserMessage(contextPrefix + query),
 		},
 	})
 
@@ -338,7 +426,9 @@ func handleQuery(query string, history *widget.Entry, status *widget.Label, voic
 		fyne.DoAndWait(func() { status.SetText("Error: " + err.Error()) })
 		return
 	}
+
 	fullAnswer := answer.String()
+	conversation.WriteString("AI: " + fullAnswer + "\n")
 
 	fyne.DoAndWait(func() {
 		appendMessage(history, "AI: "+cleanForSpeech(fullAnswer))
