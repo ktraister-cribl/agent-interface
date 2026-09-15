@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,16 +27,26 @@ import (
 	"image/color"
 
 	"github.com/BurntSushi/toml"
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/bedrock"
+	anthropicopt "github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/ardanlabs/bucky/pkg/whisper"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	openai "github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
+	openaiopt "github.com/openai/openai-go/v3/option"
 )
 
 type Config struct {
-	BraveAPIKey  string `toml:"brave_api_key"`
-	BuckyLib     string `toml:"bucky_lib"`
-	WhisperModel string `toml:"whisper_model"`
-	PiperModel   string `toml:"piper_model"`
+	Backend         string `toml:"backend"` // "brave" or "claude"
+	BraveAPIKey     string `toml:"brave_api_key"`
+	ClaudeBaseURL   string `toml:"claude_base_url"`
+	ClaudeModel     string `toml:"claude_model"`
+	ClaudeAPIKey    string `toml:"claude_api_key"`
+	ClaudeUseBedrock bool  `toml:"claude_use_bedrock"`
+	SystemPrompt    string `toml:"system_prompt"`
+	BuckyLib      string `toml:"bucky_lib"`
+	WhisperModel  string `toml:"whisper_model"`
+	PiperModel    string `toml:"piper_model"`
 }
 
 type keyBinding struct {
@@ -46,29 +59,45 @@ type whiteDisabledTheme struct {
 }
 
 var (
-	braveKey        string
+	appCfg          Config
 	piperModel      string
 	whisperModel    string
 	buckyLib        string
 	busy            int32
 	wctx            whisper.Context
-	client          openai.Client
 	mu              sync.Mutex
 	aplayProc       *exec.Cmd
 	aplayMu         sync.Mutex
-	aplayRunning    int32 // use atomic
+	aplayRunning    int32
 	currentShortcut *desktop.CustomShortcut
-	conversation    strings.Builder
+
+	braveClient openai.Client
+	braveConvo  strings.Builder
+
+	claudeClient   anthropic.Client
+	claudeMessages []anthropic.MessageParam
+	msgMu          sync.Mutex
 )
 
 func main() {
-	cfg := loadConfig()
-	fmt.Fprintf(os.Stderr, "DEBUG: model=%q lib=%q piper=%q\n", cfg.WhisperModel, cfg.BuckyLib, cfg.PiperModel)
+	appCfg = loadConfig()
 
-	braveKey = cfg.BraveAPIKey
-	buckyLib = cfg.BuckyLib
-	whisperModel = cfg.WhisperModel
-	piperModel = cfg.PiperModel
+	if appCfg.Backend == "" {
+		appCfg.Backend = "brave"
+	}
+	if appCfg.ClaudeModel == "" {
+		appCfg.ClaudeModel = "us.anthropic.claude-sonnet-4-6"
+	}
+	if appCfg.SystemPrompt == "" {
+		appCfg.SystemPrompt = "You are a helpful voice assistant. Keep responses concise and conversational."
+	}
+
+	fmt.Fprintf(os.Stderr, "DEBUG: backend=%q model=%q lib=%q piper=%q\n",
+		appCfg.Backend, appCfg.WhisperModel, appCfg.BuckyLib, appCfg.PiperModel)
+
+	buckyLib = appCfg.BuckyLib
+	whisperModel = appCfg.WhisperModel
+	piperModel = appCfg.PiperModel
 
 	// Init whisper
 	if err := whisper.Load(buckyLib); err != nil {
@@ -85,11 +114,47 @@ func main() {
 	}
 	defer whisper.Free(wctx)
 
-	// Init Brave client
-	client = openai.NewClient(
-		option.WithAPIKey(braveKey),
-		option.WithBaseURL("https://api.search.brave.com/res/v1"),
-	)
+	// Init LLM client
+	switch appCfg.Backend {
+	case "claude":
+		var opts []anthropicopt.RequestOption
+		if appCfg.ClaudeUseBedrock {
+			token := appCfg.ClaudeAPIKey
+			if token == "" {
+				token = "-"
+			}
+			awsCfg := aws.Config{
+				Region:                  "us-east-1",
+				BearerAuthTokenProvider: bedrock.NewStaticBearerTokenProvider(token),
+			}
+			opts = append(opts, bedrock.WithConfig(awsCfg))
+			if appCfg.ClaudeBaseURL != "" {
+				parsed, err := url.Parse(appCfg.ClaudeBaseURL)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "invalid claude_base_url: %v\n", err)
+					os.Exit(1)
+				}
+				transport := &proxyTransport{
+					inner:      http.DefaultTransport,
+					scheme:     parsed.Scheme,
+					host:       parsed.Host,
+					pathPrefix: strings.TrimRight(parsed.Path, "/"),
+				}
+				opts = append(opts, anthropicopt.WithHTTPClient(&http.Client{Transport: transport}))
+			}
+		} else {
+			opts = append(opts, anthropicopt.WithAPIKey(appCfg.ClaudeAPIKey))
+			if appCfg.ClaudeBaseURL != "" {
+				opts = append(opts, anthropicopt.WithBaseURL(appCfg.ClaudeBaseURL))
+			}
+		}
+		claudeClient = anthropic.NewClient(opts...)
+	default:
+		braveClient = openai.NewClient(
+			openaiopt.WithAPIKey(appCfg.BraveAPIKey),
+			openaiopt.WithBaseURL("https://api.search.brave.com/res/v1"),
+		)
+	}
 
 	// --- Fyne app ---
 	a := app.NewWithID("io.ktraister.agent")
@@ -128,16 +193,17 @@ func main() {
 	// Clear Button
 	clearBtn := widget.NewButton("Clear", func() {
 		history.SetText("")
-		conversation.Reset()
+		braveConvo.Reset()
+		msgMu.Lock()
+		claudeMessages = nil
+		msgMu.Unlock()
 	})
 	clearBtn.Importance = widget.WarningImportance
 
 	// Talk button
 	var talkBtn *widget.Button
 
-	// Inside main(), after talkBtn and status are defined:
 	triggerTalk := func() {
-		// Reject if already processing or speaking
 		if atomic.LoadInt32(&busy) == 1 {
 			status.SetText("Busy...")
 			return
@@ -162,7 +228,6 @@ func main() {
 			fyne.DoAndWait(func() { status.SetText("Transcribing...") })
 			text := transcribe(wavData)
 			if text == "" {
-				// BLANK_AUDIO — silently ignore
 				atomic.StoreInt32(&busy, 0)
 				fyne.DoAndWait(func() {
 					status.SetText("Ready")
@@ -172,11 +237,9 @@ func main() {
 			}
 			fyne.DoAndWait(func() { talkBtn.Enable() })
 
-			// handleQuery + speak runs here, then clears busy
 			go func() {
 				handleQuery(text, history, status, voiceCheck)
 				atomic.StoreInt32(&busy, 0)
-				fyne.DoAndWait(func() { status.SetText("Ready") })
 			}()
 		}()
 	}
@@ -184,7 +247,7 @@ func main() {
 	talkBtn = widget.NewButton("Talk", triggerTalk)
 	talkBtn.Importance = widget.SuccessImportance
 
-	// Stop button:
+	// Stop button
 	stopBtn := widget.NewButton("Stop", func() {
 		aplayMu.Lock()
 		if aplayProc != nil && atomic.LoadInt32(&aplayRunning) == 1 {
@@ -197,22 +260,37 @@ func main() {
 
 	// Configure button
 	configureBtn := widget.NewButton("Configure", func() {
-		options := []string{
-			"Ctrl+Space",
-			"Ctrl+T",
-			"Delete",
-			"F9",
-			"F10",
-			"Ctrl+Alt+Space",
-		}
+		var options []string
+		keyMap := make(map[string]keyBinding)
 
-		keyMap := map[string]keyBinding{
-			"Ctrl+Space":     {fyne.KeySpace, fyne.KeyModifierControl},
-			"Ctrl+T":         {fyne.KeyT, fyne.KeyModifierControl},
-			"Delete":         {fyne.KeyDelete, 0},
-			"F9":             {fyne.KeyF9, 0},
-			"F10":            {fyne.KeyF10, 0},
-			"Ctrl+Alt+Space": {fyne.KeySpace, fyne.KeyModifierControl | fyne.KeyModifierAlt},
+		if runtime.GOOS == "darwin" {
+			options = []string{
+				"Cmd+Space",
+				"Cmd+T",
+				"Cmd+Shift+Space",
+				"F9",
+				"F10",
+			}
+			keyMap["Cmd+Space"] = keyBinding{fyne.KeySpace, fyne.KeyModifierSuper}
+			keyMap["Cmd+T"] = keyBinding{fyne.KeyT, fyne.KeyModifierSuper}
+			keyMap["Cmd+Shift+Space"] = keyBinding{fyne.KeySpace, fyne.KeyModifierSuper | fyne.KeyModifierShift}
+			keyMap["F9"] = keyBinding{fyne.KeyF9, 0}
+			keyMap["F10"] = keyBinding{fyne.KeyF10, 0}
+		} else {
+			options = []string{
+				"Ctrl+Space",
+				"Ctrl+T",
+				"Delete",
+				"F9",
+				"F10",
+				"Ctrl+Alt+Space",
+			}
+			keyMap["Ctrl+Space"] = keyBinding{fyne.KeySpace, fyne.KeyModifierControl}
+			keyMap["Ctrl+T"] = keyBinding{fyne.KeyT, fyne.KeyModifierControl}
+			keyMap["Delete"] = keyBinding{fyne.KeyDelete, 0}
+			keyMap["F9"] = keyBinding{fyne.KeyF9, 0}
+			keyMap["F10"] = keyBinding{fyne.KeyF10, 0}
+			keyMap["Ctrl+Alt+Space"] = keyBinding{fyne.KeySpace, fyne.KeyModifierControl | fyne.KeyModifierAlt}
 		}
 
 		keySelect := widget.NewSelect(options, func(selected string) {
@@ -248,17 +326,27 @@ func main() {
 		historyScroll,
 	))
 
-	// Default hotkey: Ctrl+Space
-	currentShortcut = &desktop.CustomShortcut{
-		KeyName:  fyne.KeySpace,
-		Modifier: fyne.KeyModifierControl,
+	// Default hotkey: Cmd+Space on macOS, Ctrl+Space on Linux
+	if runtime.GOOS == "darwin" {
+		currentShortcut = &desktop.CustomShortcut{
+			KeyName:  fyne.KeySpace,
+			Modifier: fyne.KeyModifierSuper,
+		}
+	} else {
+		currentShortcut = &desktop.CustomShortcut{
+			KeyName:  fyne.KeySpace,
+			Modifier: fyne.KeyModifierControl,
+		}
 	}
 	w.Canvas().AddShortcut(currentShortcut, func(_ fyne.Shortcut) {
 		triggerTalk()
 	})
-	status.SetText("Ready (hotkey: Ctrl+Space)")
+	if runtime.GOOS == "darwin" {
+		status.SetText("Ready (hotkey: Cmd+Space)")
+	} else {
+		status.SetText("Ready (hotkey: Ctrl+Space)")
+	}
 
-	// In main(), before w.ShowAndRun():
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGUSR1)
 	go func() {
@@ -272,7 +360,117 @@ func main() {
 	w.ShowAndRun()
 }
 
-// --- Audio recording (sox + arecord, silence detection) ---
+// --- Handle a query (dispatches to configured backend) ---
+func handleQuery(query string, history *widget.Entry, status *widget.Label, voiceCheck *widget.Check) {
+	if query == "[ Silence ]" {
+		return
+	}
+
+	fyne.DoAndWait(func() {
+		appendMessage(history, "You: "+query)
+		status.SetText("Thinking...")
+	})
+
+	var fullAnswer string
+	var err error
+
+	switch appCfg.Backend {
+	case "claude":
+		fullAnswer, err = queryBedrock(query)
+	default:
+		fullAnswer, err = queryBrave(query)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "LLM error: %v\n", err)
+		fyne.DoAndWait(func() { status.SetText("Error: " + err.Error()) })
+		return
+	}
+
+	fyne.DoAndWait(func() {
+		appendMessage(history, "AI: "+cleanForSpeech(fullAnswer))
+	})
+
+	if voiceCheck.Checked {
+		fyne.DoAndWait(func() { status.SetText("Speaking...") })
+		speak(fullAnswer)
+		fyne.DoAndWait(func() { status.SetText("Ready") })
+	} else {
+		fyne.DoAndWait(func() { status.SetText("Ready") })
+	}
+}
+
+func queryBrave(query string) (string, error) {
+	braveConvo.WriteString("User: " + query + "\n")
+
+	contextPrefix := ""
+	if braveConvo.Len() > 0 {
+		contextPrefix = "Previous conversation:\n" + braveConvo.String() + "\n\nCurrent question: "
+	}
+
+	stream := braveClient.Chat.Completions.NewStreaming(context.Background(), openai.ChatCompletionNewParams{
+		Model: openai.ChatModel("brave"),
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.UserMessage(contextPrefix + query),
+		},
+	})
+
+	var answer strings.Builder
+	for stream.Next() {
+		chunk := stream.Current()
+		answer.WriteString(chunk.Choices[0].Delta.Content)
+	}
+	if err := stream.Err(); err != nil {
+		return "", err
+	}
+
+	fullAnswer := answer.String()
+	braveConvo.WriteString("AI: " + fullAnswer + "\n")
+	return fullAnswer, nil
+}
+
+func queryBedrock(query string) (string, error) {
+	msgMu.Lock()
+	claudeMessages = append(claudeMessages, anthropic.NewUserMessage(anthropic.NewTextBlock(query)))
+	messages := make([]anthropic.MessageParam, len(claudeMessages))
+	copy(messages, claudeMessages)
+	msgMu.Unlock()
+
+	stream := claudeClient.Messages.NewStreaming(context.Background(), anthropic.MessageNewParams{
+		Model:     appCfg.ClaudeModel,
+		MaxTokens: 4096,
+		System: []anthropic.TextBlockParam{{
+			Text: appCfg.SystemPrompt,
+		}},
+		Messages: messages,
+	})
+
+	accumulated := anthropic.Message{}
+	for stream.Next() {
+		accumulated.Accumulate(stream.Current())
+	}
+	if err := stream.Err(); err != nil {
+		return "", err
+	}
+
+	var answer strings.Builder
+	for _, block := range accumulated.Content {
+		switch v := block.AsAny().(type) {
+		case anthropic.TextBlock:
+			answer.WriteString(v.Text)
+		}
+	}
+
+	fullAnswer := answer.String()
+
+	msgMu.Lock()
+	claudeMessages = append(claudeMessages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(fullAnswer)))
+	msgMu.Unlock()
+
+	return fullAnswer, nil
+}
+
+// --- Audio recording (silence detection) ---
 func recordAudio() []byte {
 	const (
 		sampleRate     = 16000
@@ -291,8 +489,7 @@ func recordAudio() []byte {
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
-	cmd := exec.Command("arecord", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw", "-")
-	cmd.Stdin = nil
+	cmd := recordCmd()
 	pipe, err := cmd.StdoutPipe()
 	if err != nil {
 		tmpFile.Close()
@@ -335,17 +532,16 @@ func recordAudio() []byte {
 		if isSpeech {
 			speechDetected = true
 			silenceFrames = 0
-			tmpFile.Write(frame) // only write frames that contain speech (and surrounding context)
+			tmpFile.Write(frame)
 		} else if speechDetected {
-			tmpFile.Write(frame) // write trailing silence too (natural ending)
+			tmpFile.Write(frame)
 			silenceFrames++
 			if silenceFrames*frameMs >= silenceMs {
-				break // done — 1s of silence after speech
+				break
 			}
 		} else {
-			// Haven't detected speech yet
 			if totalFrames >= startTimeout {
-				break // timeout — no speech detected, return nothing
+				break
 			}
 		}
 	}
@@ -366,7 +562,6 @@ func transcribe(rawData []byte) string {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Convert S16_LE to float32 (whisper expects this)
 	numSamples := len(rawData) / 2
 	samples := make([]float32, numSamples)
 	for i := 0; i < numSamples; i++ {
@@ -388,61 +583,6 @@ func transcribe(rawData []byte) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// --- Handle a query ---
-func handleQuery(query string, history *widget.Entry, status *widget.Label, voiceCheck *widget.Check) {
-
-	if query == "[ Silence ]" {
-		return
-	}
-
-	fyne.DoAndWait(func() {
-		appendMessage(history, "You: "+query)
-		status.SetText("Thinking...")
-	})
-
-	// Append to history
-	conversation.WriteString("User: " + query + "\n")
-
-	// Build the message with context
-	contextPrefix := ""
-	if conversation.Len() > 0 {
-		contextPrefix = "Previous conversation:\n" + conversation.String() + "\n\nCurrent question: "
-	}
-
-	// Use contextPrefix + query as the message
-	stream := client.Chat.Completions.NewStreaming(context.Background(), openai.ChatCompletionNewParams{
-		Model: openai.ChatModel("brave"),
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.UserMessage(contextPrefix + query),
-		},
-	})
-
-	var answer strings.Builder
-	for stream.Next() {
-		chunk := stream.Current()
-		answer.WriteString(chunk.Choices[0].Delta.Content)
-	}
-	if err := stream.Err(); err != nil {
-		fyne.DoAndWait(func() { status.SetText("Error: " + err.Error()) })
-		return
-	}
-
-	fullAnswer := answer.String()
-	conversation.WriteString("AI: " + fullAnswer + "\n")
-
-	fyne.DoAndWait(func() {
-		appendMessage(history, "AI: "+cleanForSpeech(fullAnswer))
-	})
-
-	if voiceCheck.Checked {
-		fyne.DoAndWait(func() { status.SetText("Speaking...") })
-		speak(fullAnswer)
-		fyne.DoAndWait(func() { status.SetText("Ready") })
-	} else {
-		fyne.DoAndWait(func() { status.SetText("Ready") })
-	}
-}
-
 // --- TTS ---
 func speak(text string) {
 	text = cleanForSpeech(text)
@@ -456,11 +596,11 @@ func speak(text string) {
 	}
 
 	aplayMu.Lock()
-	aplayProc = exec.Command("aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-")
+	aplayProc = playCmd()
 	aplayProc.Stdin = &wavBuf
 	if err := aplayProc.Start(); err != nil {
 		aplayMu.Unlock()
-		fmt.Fprintf(os.Stderr, "aplay: %v\n", err)
+		fmt.Fprintf(os.Stderr, "playback: %v\n", err)
 		return
 	}
 	atomic.StoreInt32(&aplayRunning, 1)
@@ -474,7 +614,7 @@ func speak(text string) {
 func appendMessage(history *widget.Entry, text string) {
 	current := history.Text
 	history.SetText(current + text + "\n")
-	history.CursorRow = len(strings.Split(history.Text, "\n")) - 1 // scroll to bottom
+	history.CursorRow = len(strings.Split(history.Text, "\n")) - 1
 }
 
 func cleanForSpeech(text string) string {
@@ -512,6 +652,21 @@ func (t whiteDisabledTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVa
 func beep(freq int) {
 	exec.Command("play", "-n", "-q", "-r", "22050", "-c", "1",
 		"synth", "0.1", "sine", fmt.Sprintf("%d", freq)).Run()
+}
+
+type proxyTransport struct {
+	inner      http.RoundTripper
+	scheme     string
+	host       string
+	pathPrefix string
+}
+
+func (t *proxyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r.URL.Scheme = t.scheme
+	r.URL.Host = t.host
+	r.URL.Path = t.pathPrefix + r.URL.Path
+	r.Host = t.host
+	return t.inner.RoundTrip(r)
 }
 
 func loadConfig() Config {
